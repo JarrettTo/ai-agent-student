@@ -21,6 +21,13 @@ import speech_recognition as sr
 import json
 import signal
 import sys
+import numpy as np
+import noisereduce as nr
+import scipy.io.wavfile as wav
+from scipy.signal import butter, lfilter
+import openai
+from collections import deque
+from openai import OpenAI
 
 load_dotenv()
 EMAIL = os.getenv("EMAIL")
@@ -28,7 +35,7 @@ PASSWORD = os.getenv("PASSWORD")
 GMEET_LINK = os.getenv("GMEET_LINK")
 
 # Configure Google Cloud Speech-to-Text
-
+global_driver = None
 app = Flask(__name__)
 CORS(app)
 # Initialize Google Cloud Speech-to-Text client
@@ -38,79 +45,100 @@ if not os.path.exists(model_path):
     raise ValueError("VOSK model not found. Download a model from https://alphacephei.com/vosk/models and extract it to the 'model' directory.")
 
 # Load the model once at startup
-#vosk_model = Model(model_path)
-
+vosk_model = Model(model_path)
+global message_tab_opened = False
+openai.api_key = os.getenv("OPENAI_API_KEY")
+rolling_history = deque(maxlen=50)  # Adjust the size for how far back you want to look
 recording_frames = []
 is_running = True
 
 audio_buffer = b""
 buffer_threshold = 16000 * 6  # Process ~2 seconds of audio (16kHz * 2 seconds)
-def process_audio_with_google_streaming():
+def check_and_respond_with_openai(context):
+    
     """
-    Process audio using Google Speech-to-Text Streaming API for real-time transcription.
+    Use OpenAI to check if there's a question and respond appropriately.
     """
-    global audio_buffer, is_running
+    print("CONTEXT:", context)
+    client = OpenAI(
+    # defaults to os.environ.get("OPENAI_API_KEY")
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+    prompt = f"""
+    You are a helpful transcript assistant. Analyze the following context which contains a speech to text transcript that is rough and uncleaned.
+    "{context}"
 
+    If any subset of words in the sentence contains or even resembles a question, reply with the best answer to that question, but only give the answer (for example if you detect the question What is a Tomato, your answer should be "It is a fruit.".  If the question you find is what is _____, answer it). Do not reply with a question or relay the question back. If it contains keywords that indicate the presence of a question such as "what, where, when, why, who, how", try your best to piece together question based on words that sound similar or just fill in the gaps of possible missing words. If you really can't make out a question, reply with "My mic is broken po but I'm here."
+    """
     try:
-        # Configure Google Speech-to-Text
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,  # Match your audio rate
-            language_code="en-US",  # Change this to your desired language
-            enable_automatic_punctuation=True,  # Optional: punctuation in output
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Use a suitable OpenAI GPT model
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant reading a speech to text transcript that is rough and uncleaned."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=500,   # Adjust based on the expected response length
+            top_p=1.0,        # Full probability distribution
+            frequency_penalty=0,  # No penalty for frequent tokens
+            presence_penalty=0    # No penalty for introducing new topics
         )
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=config,
-            interim_results=True,  # Get partial results
-        )
-
-        # Streaming generator function
-        def audio_generator():
-            global audio_buffer
-            while is_running:
-                if audio_buffer:
-                    # Send the buffered audio
-                    yield speech.StreamingRecognizeRequest(audio_content=audio_buffer)
-                    audio_buffer = b""  # Clear the buffer after sending
-                else:
-                    # Wait a short time to avoid excessive looping
-                    time.sleep(0.1)
-
-        # Debugging: Ensure the generator is yielding properly
-        def debug_generator():
-            for request in audio_generator():
-                print("Debug: Sending audio chunk to Google STT")
-                yield request
-
-        # Start streaming recognition
-        responses = speech_client.streaming_recognize(streaming_config, debug_generator())
-
-        # Process responses
-        transcript = ""
-        for response in responses:
-            if not response.results:
-                continue
-
-            # Get the first result
-            result = response.results[0]
-
-            if result.is_final:  # Process finalized results
-                transcript += result.alternatives[0].transcript + " "
-                print(f"Transcript: {transcript.strip()}")
-
-                # Append to transcript.txt
-                with open("transcript.txt", "a") as transcript_file:
-                    transcript_file.write(transcript.strip() + " ")
-
-        return {"status": "Streaming transcription complete", "transcript": transcript.strip()}
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"Error in Google Streaming STT transcription: {e}")
-        return {"error": str(e)}
+        print(f"Error querying OpenAI: {e}")
+        return "I'm sorry, there was an error processing the request."
+
+def bandpass_filter(audio_data, rate, lowcut=300, highcut=3400):
+    """
+    Apply a bandpass filter to the audio.
+    """
+    nyquist = 0.5 * rate
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(1, [low, high], btype="band")
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    filtered_audio = lfilter(b, a, audio_array)
+    return filtered_audio.astype(np.int16).tobytes()
+def reduce_noise(audio_data, rate):
+    """
+    Reduce noise in the audio data using noisereduce library.
+    """
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    # Use the first 1 second of audio as a noise profile
+    noise_profile = audio_array[:rate] if len(audio_array) > rate else audio_array
+    reduced_audio = nr.reduce_noise(y=audio_array, sr=rate, y_noise=noise_profile)
+    return reduced_audio.tobytes()
+def normalize_audio(audio_data):
+    """
+    Normalize the audio to have consistent volume levels.
+    """
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    max_val = np.max(np.abs(audio_array))
+    normalized_audio = (audio_array / max_val * 32767).astype(np.int16)
+    return normalized_audio.tobytes()
+def preprocess_audio(audio_data, rate):
+    """
+    Preprocess audio by reducing noise, normalizing, downsampling, and applying bandpass filtering.
+    """
+    # Noise reduction
+    audio_data = reduce_noise(audio_data, rate)
+    
+    # Downsample to 16 kHz
+    if rate != 16000:
+        audio_data = downsample_audio(audio_data, rate, 16000)
+        rate = 16000  # Update the rate after downsampling
+
+    # Normalize audio
+    audio_data = normalize_audio(audio_data)
+
+    # Bandpass filter for human speech frequencies
+    audio_data = bandpass_filter(audio_data, rate)
+
+    return audio_data
 def process_audio_with_vosk(audio_data):
     """
     Process audio using VOSK for offline speech-to-text transcription with buffered audio.
     """
-    global audio_buffer
+    global audio_buffer, rolling_history
 
     try:
         # Append incoming audio data to the buffer
@@ -136,6 +164,23 @@ def process_audio_with_vosk(audio_data):
             if transcript.strip():
                 print(f"Transcript: {transcript.strip()}")
 
+                # Append transcript to rolling history
+                words = transcript.strip().split()
+                rolling_history.extend(words)
+
+                # Extract the last 15 words including the current transcript
+                context_words = list(rolling_history)[-15:]
+                context = " ".join(context_words)
+
+                # Check for the words "Justin" or "just in"
+                if "justin" in transcript.strip() or "just in" in transcript.strip():
+                    print("Detected mention of 'Justin' or 'just in'!")
+
+                    # Pass context to OpenAI for processing
+                    response = check_and_respond_with_openai(context)
+                    print(f"Response: {response}")
+                    send_message_to_chat(response)
+
                 # Append transcript to a file
                 with open("transcript.txt", "a") as transcript_file:
                     transcript_file.write(transcript + " ")
@@ -145,29 +190,7 @@ def process_audio_with_vosk(audio_data):
         return {"status": "Buffering audio..."}
     except Exception as e:
         print(f"Error in VOSK transcription: {e}")
-        return {"error": str(e)}
-
-@app.route('/process_audio_google', methods=['POST'])
-def process_audio_google():
-    """
-    Flask endpoint for handling audio data and performing speech-to-text transcription.
-    """
-    global audio_buffer
-
-    try:
-        audio_data = request.data
-        print(f"Received audio data: {len(audio_data)} bytes")
-
-        # Append incoming audio data to the buffer
-        audio_buffer += audio_data
-
-        # Process audio using Google Streaming STT
-        result = process_audio_with_google_streaming()
-
-        return jsonify(result), 200
-    except Exception as e:
-        print(f"Error processing audio: {e}")
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)} 
 
 @app.route('/process_audio', methods=['POST'])
 def process_audio():
@@ -176,10 +199,9 @@ def process_audio():
     """
     try:
         audio_data = request.data
-        print(f"Received audio data: {len(audio_data)} bytes")
 
         # Process the audio using VOSK
-        result = process_audio_with_google_streaming(audio_data)
+        result = process_audio_with_vosk(audio_data)
 
         return jsonify(result), 200
     except Exception as e:
@@ -243,16 +265,15 @@ def capture_audio_from_virtual_device():
         while is_running:
             audio_data = stream.read(frames_per_buffer, exception_on_overflow=False)
             recording_frames.append(audio_data)  # Save audio for the WAV file
-
+            #preprocessed_audio = preprocess_audio(audio_data, rate)
+            #recording_frames.append(preprocessed_audio)  # Save audio for the WAV file
             # Send the audio data to the Flask endpoint
             try:
                 response = requests.post(
-                    "http://127.0.0.1:5000/process_audio_google",
+                    "http://127.0.0.1:5000/process_audio",
                     data=audio_data,
                     headers={"Content-Type": "application/octet-stream"},
                 )
-                if response.status_code == 200:
-                    print(f"Audio sent: {len(audio_data)} bytes, Response: {response.status_code}")
             except Exception as e:
                 print(f"Error sending audio data: {e}")
     except Exception as e:
@@ -291,6 +312,7 @@ def join_google_meet(meet_link, email, password,audio_thread):
     :param password: Gmail password
     """
     # Set up Selenium WebDriver
+    global global_driver
     chrome_options = Options()
     chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--disable-extensions")
@@ -302,15 +324,15 @@ def join_google_meet(meet_link, email, password,audio_thread):
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     service = Service("C:/chromedriver/chromedriver-win64/chromedriver.exe")
-    driver = webdriver.Chrome(service=service, options=chrome_options)
+    global_driver = webdriver.Chrome(service=service, options=chrome_options)
 
     # Navigate to the Google Meet link
-    driver.get(meet_link)
+    global_driver.get(meet_link)
     time.sleep(10)
 
     try:
         # Wait for the input field to be present
-        name_field = WebDriverWait(driver, 10).until(
+        name_field = WebDriverWait(global_driver, 10).until(
             EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Your name']"))
         )
 
@@ -323,19 +345,70 @@ def join_google_meet(meet_link, email, password,audio_thread):
 
     try:
         # Wait for the "Ask to join" button and click it
-        ask_to_join_button = WebDriverWait(driver, 10).until(
+        ask_to_join_button = WebDriverWait(global_driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='Ask to join']]"))
         )
         ask_to_join_button.click()
         print("Successfully clicked the 'Ask to join' button.")
-        time.sleep(30)
+        time.sleep(10)
         audio_thread.start()
     except Exception as e:
         print(f"Error clicking 'Ask to join' button: {e}")
 
 
     input("Press Enter to close the browser...")
-    driver.quit()
+    
+def send_message_to_chat(message):
+    """
+    Sends a message to the Google Meet chat using the existing Selenium WebDriver instance.
+
+    :param message: The message to send in the Google Meet chat
+    """
+    global global_driver  # Access the global driver instance
+    global message_tab_opened
+    try:
+        # Open the chat panel by clicking the "Chat with everyone" button
+        if message_tab_opened != True:
+            chat_button = WebDriverWait(global_driver, 20).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        "//button[@aria-label='Chat with everyone']",
+                    )
+                )
+            )
+            chat_button.click()
+            print("Chat panel opened.")
+            message_tab_opened = False
+
+        # Wait for the chat input box to be present
+        chat_input = WebDriverWait(global_driver, 20).until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    "//textarea[@aria-label='Send a message to everyone']",
+                )
+            )
+        )
+
+        # Enter the message into the chat input box
+        chat_input.send_keys(message)
+        print("Message entered into the chat box.")
+
+        # Click the send button to send the message
+        send_button = WebDriverWait(global_driver, 20).until(
+            EC.element_to_be_clickable(
+                (
+                    By.XPATH,
+                    "//button[@aria-label='Send a message to everyone']",
+                )
+            )
+        )
+        send_button.click()
+        print("Message sent to chat.")
+
+    except Exception as chat_error:
+        print(f"Error sending message to chat: {chat_error}")
 
 
 if __name__ == "__main__":
