@@ -71,7 +71,7 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "heading_1",
                 "heading_1": {
-                    "text": [{"type": "text", "text": {"content": line[2:]}}],
+                    "rich_text": [{"type": "text", "text": {"content": line[2:]}}],
                 },
             })
         elif line.startswith("## "):  # Convert subheadings
@@ -79,7 +79,15 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "heading_2",
                 "heading_2": {
-                    "text": [{"type": "text", "text": {"content": line[3:]}}],
+                    "rich_text": [{"type": "text", "text": {"content": line[3:]}}],
+                },
+            })
+        elif line.startswith("### "):  # Convert sub-subheadings
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [{"type": "text", "text": {"content": line[4:]}}],
                 },
             })
         elif line.startswith("- "):  # Convert bullet points
@@ -87,7 +95,7 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "bulleted_list_item",
                 "bulleted_list_item": {
-                    "text": [{"type": "text", "text": {"content": line[2:]}}],
+                    "rich_text": [{"type": "text", "text": {"content": line[2:]}}],
                 },
             })
         elif line.strip():  # Convert paragraphs
@@ -95,10 +103,12 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {
-                    "text": [{"type": "text", "text": {"content": line.strip()}}],
+                    "rich_text": [{"type": "text", "text": {"content": line.strip()}}],
                 },
             })
     return blocks
+
+    
 if __name__ == "__main__":
 
     transcript = "Hi, my name is Justin. So Justin, what is a neural network? A neural network is a computational model inspired by the human brain used to recognize patterns and solve complex problems. That is correct. So we use multiple kinds of architectures such as TNNs, RNNs, and CNNs depending on the use case. So first use case example is a sports betting algorithm. In that case, we involve a lot of time series data. So in that case, we would use something called a recursive neural network or an RNN. That allows us to interpretate and make predictions based on time series data. An example of this would be using it for a sports betting algorithm. Personally, I've built one that has covered over 30 million record points for both MLB and NBA data. Secondly, we use CNN for interpreting visual data or imagery such as videos or pictures and converting them into numerical interpretations that a computer model would be able to translate. Using that data, it's often combined with other architectures such as a transformer neural network which allows us to make very complex translations, transcriptions, and conversions. A good example of something that uses transformer neural networks or TNNs are LLMs such as ChatGPT and other extensive or advanced AI models. That's it for today's class. I hope you guys learned something. See you in the next class. Bye bye."

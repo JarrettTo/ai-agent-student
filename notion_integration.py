@@ -30,7 +30,7 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "heading_1",
                 "heading_1": {
-                    "text": [{"type": "text", "text": {"content": line[2:]}}],
+                    "rich_text": [{"type": "text", "text": {"content": line[2:]}}],
                 },
             })
         elif line.startswith("## "):  # Convert subheadings
@@ -38,7 +38,15 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "heading_2",
                 "heading_2": {
-                    "text": [{"type": "text", "text": {"content": line[3:]}}],
+                    "rich_text": [{"type": "text", "text": {"content": line[3:]}}],
+                },
+            })
+        elif line.startswith("### "):  # Convert sub-subheadings
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [{"type": "text", "text": {"content": line[4:]}}],
                 },
             })
         elif line.startswith("- "):  # Convert bullet points
@@ -46,7 +54,7 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "bulleted_list_item",
                 "bulleted_list_item": {
-                    "text": [{"type": "text", "text": {"content": line[2:]}}],
+                    "rich_text": [{"type": "text", "text": {"content": line[2:]}}],
                 },
             })
         elif line.strip():  # Convert paragraphs
@@ -54,7 +62,7 @@ def format_notes_for_notion(notes):
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {
-                    "text": [{"type": "text", "text": {"content": line.strip()}}],
+                    "rich_text": [{"type": "text", "text": {"content": line.strip()}}],
                 },
             })
     return blocks
