@@ -23,146 +23,41 @@ import json
 import signal
 import sys
 import numpy as np
-import noisereduce as nr
-import scipy.io.wavfile as wav
-from scipy.signal import butter, lfilter
 import openai
 from collections import deque
 from openai import OpenAI
+from audio_processing import preprocess_audio
+from notion_integration import format_notes_for_notion,notes_to_notion
+from openai_functions import check_and_respond_with_openai, openai_make_notes, chatgpt_transcript
 
 load_dotenv()
 EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 GMEET_LINK = os.getenv("GMEET_LINK")
+NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN")
+NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID")
 
-# Configure Google Cloud Speech-to-Text
-global_driver = None
+#Flask Configuration
 app = Flask(__name__)
 CORS(app)
-# Initialize Google Cloud Speech-to-Text client
+
+#VOSK model initialization
 speech_client = speech.SpeechClient()
 model_path = "model"  # Path to your VOSK model directory
 if not os.path.exists(model_path):
     raise ValueError("VOSK model not found. Download a model from https://alphacephei.com/vosk/models and extract it to the 'model' directory.")
-
-# Load the model once at startup
 vosk_model = Model(model_path)
+
+#flags and audio buffer configuration
 global message_tab_opened
-openai.api_key = os.getenv("OPENAI_API_KEY")
-rolling_history = deque(maxlen=50)  # Adjust the size for how far back you want to look
+global_driver = None
+rolling_history = deque(maxlen=50)  
 recording_frames = []
 is_running = True
-NOTION_API_TOKEN = os.getenv("NOTION_API_TOKEN")
-NOTION_PAGE_ID = os.getenv("NOTION_PAGE_ID")  # Replace with your target page ID or database ID
-notion = Client(auth=NOTION_API_TOKEN)
 audio_buffer = b""
 buffer_threshold = 16000 * 6  # Process ~2 seconds of audio (16kHz * 2 seconds)
-client = OpenAI(
-    # defaults to os.environ.get("OPENAI_API_KEY")
-        api_key=os.getenv("OPENAI_API_KEY"),
-    )
-def check_and_respond_with_openai(context):
-    
-    """
-    Use OpenAI to check if there's a question and respond appropriately.
-    """
-    print("CONTEXT:", context)
-    prompt = f"""
-    You are a helpful transcript assistant. Analyze the following context which contains a speech to text transcript that is rough and uncleaned.
-    "{context}"
 
-    If any subset of words in the sentence contains or even resembles a question, reply with the best answer to that question, but only give the answer (for example if you detect the question What is a Tomato, your answer should be "It is a fruit.".  If the question you find is what is _____, answer it). Do not reply with a question or relay the question back. If it contains keywords that indicate the presence of a question such as "what, where, when, why, who, how", try your best to piece together question based on words that sound similar or just fill in the gaps of possible missing words. If you really can't make out a question, reply with "My mic is broken po but I'm here."
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Use a suitable OpenAI GPT model
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant reading a speech to text transcript that is rough and uncleaned."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,   # Adjust based on the expected response length
-            top_p=1.0,        # Full probability distribution
-            frequency_penalty=0,  # No penalty for frequent tokens
-            presence_penalty=0    # No penalty for introducing new topics
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error querying OpenAI: {e}")
-        return "I'm sorry, there was an error processing the request."
-def openai_make_notes(transcript):
-    
-    """
-    Use OpenAI to generate notes given a transcript.
-    """
-    prompt = f"""
-    You are a helpful notetaker. Analyze the following transcript from a university class.
-    "{transcript}"
 
-    Format the notes with headings, bullet points, and key action items where applicable. Make it comprehensive and do your best to clean and adjust any possible mistranscripted words based on potential context. Only answer with the notes format, don't say anything else
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Use a suitable OpenAI GPT model
-            messages=[
-                {"role": "system", "content": "You are a helpful notetaker. Analyze the following transcript from a university class."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=3000,   # Adjust based on the expected response length
-            top_p=1.0,        # Full probability distribution
-            frequency_penalty=0,  # No penalty for frequent tokens
-            presence_penalty=0    # No penalty for introducing new topics
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Error querying OpenAI: {e}")
-        return "I'm sorry, there was an error processing the request."
-def bandpass_filter(audio_data, rate, lowcut=300, highcut=3400):
-    """
-    Apply a bandpass filter to the audio.
-    """
-    nyquist = 0.5 * rate
-    low = lowcut / nyquist
-    high = highcut / nyquist
-    b, a = butter(1, [low, high], btype="band")
-    audio_array = np.frombuffer(audio_data, dtype=np.int16)
-    filtered_audio = lfilter(b, a, audio_array)
-    return filtered_audio.astype(np.int16).tobytes()
-def reduce_noise(audio_data, rate):
-    """
-    Reduce noise in the audio data using noisereduce library.
-    """
-    audio_array = np.frombuffer(audio_data, dtype=np.int16)
-    # Use the first 1 second of audio as a noise profile
-    noise_profile = audio_array[:rate] if len(audio_array) > rate else audio_array
-    reduced_audio = nr.reduce_noise(y=audio_array, sr=rate, y_noise=noise_profile)
-    return reduced_audio.tobytes()
-def normalize_audio(audio_data):
-    """
-    Normalize the audio to have consistent volume levels.
-    """
-    audio_array = np.frombuffer(audio_data, dtype=np.int16)
-    max_val = np.max(np.abs(audio_array))
-    normalized_audio = (audio_array / max_val * 32767).astype(np.int16)
-    return normalized_audio.tobytes()
-def preprocess_audio(audio_data, rate):
-    """
-    Preprocess audio by reducing noise, normalizing, downsampling, and applying bandpass filtering.
-    """
-    # Noise reduction
-    audio_data = reduce_noise(audio_data, rate)
-    
-    # Downsample to 16 kHz
-    if rate != 16000:
-        audio_data = downsample_audio(audio_data, rate, 16000)
-        rate = 16000  # Update the rate after downsampling
-
-    # Normalize audio
-    audio_data = normalize_audio(audio_data)
-
-    # Bandpass filter for human speech frequencies
-    audio_data = bandpass_filter(audio_data, rate)
-
-    return audio_data
 def process_audio_with_vosk(audio_data):
     """
     Process audio using VOSK for offline speech-to-text transcription with buffered audio.
@@ -438,113 +333,21 @@ def send_message_to_chat(message):
 
     except Exception as chat_error:
         print(f"Error sending message to chat: {chat_error}")
-def notes_to_notion(notion_blocks):
-    try:
-        response = notion.pages.create(
-            parent={"type": "page_id", "page_id": NOTION_PAGE_ID},
-            properties={
-                "title": [
-                    {"type": "text", "text": {"content": "Generated Notes from Transcript"}}
-                ]
-            },
-            children=notion_blocks,
-        )
-        print("Notes successfully added to Notion!")
-    except Exception as e:
-        print(f"Error sending notes to Notion: {e}")
-def format_notes_for_notion(notes):
-    """
-    Convert the notes into Notion blocks for structured formatting.
 
-    Args:
-        notes (str): The structured notes generated by GPT-4.
-
-    Returns:
-        list: A list of Notion blocks to send to the Notion API.
-    """
-    # Split the notes by lines and create blocks
-    blocks = []
-    lines = notes.split("\n")  # Split notes into lines for processing
-
-    for line in lines:
-        if line.strip():  # Ignore empty lines
-            if line.startswith("# "):  # Heading 1
-                blocks.append({
-                    "type": "heading_1",
-                    "heading_1": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": line[2:]}}
-                        ]
-                    }
-                })
-            elif line.startswith("## "):  # Heading 2
-                blocks.append({
-                    "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": line[3:]}}
-                        ]
-                    }
-                })
-            elif line.startswith("### "):  # Heading 3
-                blocks.append({
-                    "type": "heading_3",
-                    "heading_3": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": line[4:]}}
-                        ]
-                    }
-                })
-            else:  # Paragraph
-                blocks.append({
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [
-                            {"type": "text", "text": {"content": line}}
-                        ]
-                    }
-                })
-    return blocks
-def chatgpt_transcript():
-    """
-    Opens debug_audio.wav, transcribes it using OpenAI Whisper, and returns the text.
-    """
-    try:
-        audio_file_path = "debug_audio.wav"  # Path to your audio file
-        with open(audio_file_path, "rb") as audio_file:
-            transcription = client.audio.translations.create(
-                model="whisper-1",
-                file=audio_file,
-            )
-        print("Transcription: ", transcription.text)
-        return transcription.text
-    except Exception as e:
-        print(f"Error transcribing audio: {e}")
-        return None
 
 if __name__ == "__main__":
-    # Start Flask server in a separate thread
     signal.signal(signal.SIGINT, handle_exit)
     global message_tab_opened
     message_tab_opened = False
     flask_thread = Thread(target=start_flask_app)
     flask_thread.start()
-
-    # Start capturing audio in another thread
     audio_thread = Thread(target=capture_audio_from_virtual_device)
-    
-
-    # Join Google Meet
-
     join_google_meet(GMEET_LINK,EMAIL,PASSWORD,audio_thread)
-
     is_running = False  # Stop the audio recording thread
-
-    # Process the audio file and print the transcript
     transcript = chatgpt_transcript()
     if transcript:
         print("Final Transcript:")
         print(transcript)
         notes=openai_make_notes(transcript)
         notion_blocks=format_notes_for_notion(notes)
-        notes_to_notion(notion_blocks)
+        notes_to_notion(NOTION_API_TOKEN, NOTION_PAGE_ID,notion_blocks)
